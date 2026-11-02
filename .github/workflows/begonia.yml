@@ -1,0 +1,219 @@
+name: begonia KernelSU-Next
+
+on:
+  workflow_dispatch:
+
+env:
+  # crDroid 9.11 (Android 13, 2023-11-27) 用的内核源码
+  KERNEL_REPO: https://github.com/begonia-dev/android_kernel_xiaomi_mt6785
+  KERNEL_BRANCH: "13.0"
+  DEFCONFIG: begonia_user_defconfig
+  DEVICE: begonia
+  KSU_BRANCH: legacy
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential curl flex git \
+            libelf-dev libssl-dev lz4 python3 zip cpio device-tree-compiler
+
+      - name: Kernel source
+        run: |
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+          head -4 kernel/Makefile
+
+      - name: Toolchain
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/tc
+          echo "$HOME/tc/bin" >> $GITHUB_PATH
+
+      - name: Integrate KernelSU-Next
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s $KSU_BRANCH
+
+      - name: Apply KernelSU-Next manual hooks
+        # 4.14 内核不支持 kprobes hook (需 >=5.10) 和 syscall table hook (需 >=4.17)，
+        # 只能用手动 hook。脚本同时兼容 4.9 / 4.14，对不上会报错并指出文件。
+        working-directory: kernel
+        shell: python3 {0}
+        run: |
+          #!/usr/bin/env python3
+          # KernelSU-Next manual hooks for non-GKI kernels (tested on 4.9 and 4.14).
+          # Run from the kernel source root. Already-hooked files are skipped.
+          import re, sys
+
+          G = '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+          E = '#endif\n'
+          failed = []
+
+          def body_span(s, header_re):
+              m = re.search(header_re, s, re.M)
+              if not m:
+                  return None
+              start = s.index('{', m.end() - 1) + 1
+              return m.start(), start
+
+          def hook(path, header_re, decl, after_re, call, init_fix=None):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  failed.append(f'{path}: file not found'); return
+              if 'ksu_handle_' in s:
+                  print(f'[skip] {path}: already hooked'); return
+              span = body_span(s, header_re)
+              if not span:
+                  failed.append(f'{path}: function not found ({header_re})'); return
+              fstart, bstart = span
+              body = s[bstart:bstart + 3000]
+              post = ''
+              if init_fix:
+                  # split "type var = expr;" into "type var;" + hook + "var = expr;"
+                  m = re.search(init_fix, body, re.M)
+                  if not m:
+                      failed.append(f'{path}: initializer not found ({init_fix})'); return
+                  body = body[:m.start()] + m.group('decl') + ';\n' + body[m.end():]
+                  post = '\t' + m.group('var') + ' = ' + m.group('expr') + ';\n'
+              m = re.search(after_re, body, re.M)
+              if not m:
+                  failed.append(f'{path}: insertion point not found ({after_re})'); return
+              body = body[:m.end()] + '\n' + G + call + E + post + body[m.end():]
+              s = s[:fstart] + G + decl + E + '\n' + s[fstart:bstart] + body + s[bstart + 3000:]
+              open(path, 'w').write(s)
+              print(f'[ok]   {path}')
+
+          # Last local declaration line before the first statement
+          LAST_DECL = r'^\t[^\n]*;\n(?=\n)'
+
+          hook('kernel/reboot.c',
+               r'^SYSCALL_DEFINE4\(reboot,[^{]*\{',
+               'extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,\n\t\t\t\t void __user **arg);\n',
+               LAST_DECL,
+               '\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n')
+
+          hook('fs/exec.c',
+               r'^static int do_execveat_common\(int fd, struct filename \*filename,[^{]*\{',
+               'extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\t       void *argv, void *envp, int *flags);\n',
+               LAST_DECL,
+               '\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n')
+
+          hook('fs/open.c',
+               r'^(SYSCALL_DEFINE3\(faccessat, int, dfd|long do_faccessat\(int dfd)[^{]*\{',
+               'extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\t\tint *mode, int *flags);\n',
+               LAST_DECL,
+               '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n')
+
+          # 4.11+: vfs_statx(dfd, filename, flags, ...); older: vfs_fstatat(dfd, filename, stat, flag)
+          _s = open('fs/stat.c').read()
+          if re.search(r'^int vfs_statx\(int dfd, const char __user \*filename, int flags,', _s, re.M):
+              hook('fs/stat.c',
+                   r'^int vfs_statx\(int dfd, const char __user \*filename, int flags,[^{]*\{',
+                   'extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t   int *flags);\n',
+                   LAST_DECL,
+                   '\tksu_handle_stat(&dfd, &filename, &flags);\n')
+          else:
+              hook('fs/stat.c',
+                   r'^int vfs_fstatat\(int dfd, const char __user \*filename,[^{]*\{',
+                   'extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t   int *flags);\n',
+                   LAST_DECL,
+                   '\tksu_handle_stat(&dfd, &filename, &flag);\n')
+
+          hook('fs/read_write.c',
+               r'^SYSCALL_DEFINE3\(read, unsigned int, fd,[^{]*\{',
+               'extern void ksu_handle_sys_read(unsigned int fd);\n',
+               LAST_DECL,
+               '\tksu_handle_sys_read(fd);\n',
+               init_fix=r'^(?P<decl>\tstruct fd (?P<var>f)) = (?P<expr>fdget_pos\(fd\));\n')
+
+          hook('drivers/input/input.c',
+               r'^static void input_handle_event\(struct input_dev \*dev,[^{]*\{',
+               'extern int ksu_handle_input_handle_event(unsigned int *type,\n\t\t\t\t\t unsigned int *code, int *value);\n',
+               LAST_DECL,
+               '\tksu_handle_input_handle_event(&type, &code, &value);\n',
+               init_fix=r'^(?P<decl>\tint (?P<var>disposition)) = (?P<expr>input_get_disposition\(dev, type, code, &value\));\n')
+
+          hook('security/selinux/avc.c',
+               r'^noinline int slow_avc_audit\([^{]*\{',
+               'extern int ksu_handle_slow_avc_audit(u32 *tsid);\n',
+               LAST_DECL,
+               '\tksu_handle_slow_avc_audit(&tsid);\n')
+
+          if failed:
+              print('\n[FAIL] could not apply hooks:\n  ' + '\n  '.join(failed))
+              sys.exit(1)
+
+      - name: KSU config fragment
+        working-directory: kernel
+        run: |
+          # CONFIG_LLVM_POLLY 需要带 Polly 的新版 clang，proton-clang 13 不支持；
+          # Polly 只是性能优化，关掉不影响功能。
+          printf '%s\n' \
+            CONFIG_KSU=y \
+            CONFIG_KSU_MANUAL_HOOK=y \
+            '# CONFIG_LLVM_POLLY is not set' \
+            > arch/arm64/configs/ksu.config
+
+      - name: Build
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          # 参数与 crDroid 设备树 BoardConfig.mk 中 TARGET_KERNEL_ADDITIONAL_FLAGS 一致
+          ARGS="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang \
+            AS=llvm-as AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          HOST="-fuse-ld=lld -Wno-unused-command-line-argument"
+          make $ARGS HOSTCFLAGS="$HOST" HOSTLDFLAGS="-fuse-ld=lld" $DEFCONFIG ksu.config
+          grep -E "CONFIG_KSU|LLVM_POLLY" out/.config
+          make $ARGS HOSTCFLAGS="$HOST" HOSTLDFLAGS="-fuse-ld=lld" -j$(nproc --all) 2>&1 | tee ../build.log
+          grep -q "Hook mode: Manual" ../build.log
+          test -f out/arch/arm64/boot/Image.gz
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules ak3/patch ak3/ramdisk
+          # boot 头部 v2，dtb 单独存在 boot 里：只替换内核 Image.gz，保留原 dtb
+          cp kernel/out/arch/arm64/boot/Image.gz ak3/
+
+          cat > ak3/anykernel.sh << 'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=begonia KernelSU-Next
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=begonia
+          device.name2=begoniain
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+          sed -i 's/^          //' ak3/anykernel.sh
+
+          cd ak3 && zip -r9 ../begonia-KernelSU-Next-$(date +%Y%m%d).zip *
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: begonia-ksun
+          path: |
+            begonia-KernelSU-Next-*.zip
+            build.log
+            kernel/out/.config
